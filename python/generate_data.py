@@ -1,88 +1,135 @@
+# ===================================================
+# 1. ИМПОРТ БИБЛИОТЕК
+# ===================================================
+import os
 import numpy as np
 import matplotlib.pyplot as plt
 from scipy.signal import firwin, lfilter
+from sklearn.linear_model import LogisticRegression
 
-# 1. Параметры входного сигнала
-Fs = 8000  # Частота дискретизации, Гц
-duration = 4.0  # Длительность сигнала, с
-t = np.linspace(0, duration, int(Fs * duration), endpoint=False)
+# ===================================================
+# 2. ПАРАМЕТРЫ СИГНАЛА
+# ===================================================
+FS = 8000               # частота дискретизации, Гц
+DURATION = 4.0          # длительность, с
+T = np.linspace(0, DURATION, int(FS * DURATION), endpoint=False)
 
-# 2. Моделирование первичного сигнала сердцебиения
-heart_beat = np.zeros_like(t)
-for strike in np.arange(0, duration, 0.8):
-    idx = int(strike * Fs)
-    if idx + int(0.3 * Fs) < len(t):
-        # Формирование компонента S1 (частота 40 Гц, длительность 0.1 с)
-        heart_beat[idx : idx + int(0.1 * Fs)] = np.sin(2 * np.pi * 40 * t[: int(0.1 * Fs)])
-        # Формирование компонента S2 (частота 60 Гц, задержка 0.25 с, коэффициент ослабления 0.6)
-        heart_beat[idx + int(0.25 * Fs) : idx + int(0.35 * Fs)] = np.sin(2 * np.pi * 60 * t[: int(0.1 * Fs)]) * 0.6
+# ===================================================
+# 3. ГЕНЕРАЦИЯ СИГНАЛА СЕРДЦА
+# ===================================================
+heart_beat = np.zeros_like(T)
+for strike in np.arange(0, DURATION, 0.8):
+    idx = int(strike * FS)
+    if idx + int(0.3 * FS) < len(T):
+        heart_beat[idx : idx + int(0.1 * FS)] = np.sin(
+            2 * np.pi * 40 * T[: int(0.1 * FS)]
+        )
+        heart_beat[idx + int(0.25 * FS) : idx + int(0.35 * FS)] = (
+            np.sin(2 * np.pi * 60 * T[: int(0.1 * FS)]) * 0.6
+        )
 
-# 3. Моделирование высокочастотной помехи
-# Аддитивная смесь двух гармонических составляющих (1200 Гц и 1500 Гц) в одну строку
-high_freq_noise = np.sin(2 * np.pi * 1200 * t) * 0.4 + np.sin(2 * np.pi * 1500 * t) * 0.3
+# ===================================================
+# 4. ГЕНЕРАЦИЯ ШУМА
+# ===================================================
+high_freq_noise = (
+    np.sin(2 * np.pi * 1200 * T) * 0.4
+    + np.sin(2 * np.pi * 1500 * T) * 0.3
+)
+noisy_signal = heart_beat + high_freq_noise
 
-# 4. Формирование суммарного зашумленного сигнала
-ecg_audio_signal = heart_beat + high_freq_noise
+# ===================================================
+# 5. FIR-ФИЛЬТР
+# ===================================================
+CUTOFF_HZ = 150.0
+NUMTAPS = 101
+fir_coeffs = firwin(NUMTAPS, CUTOFF_HZ, fs=FS)
+filtered_signal = lfilter(fir_coeffs, 1.0, noisy_signal)
 
-# 5. Цифровая фильтрация низких частот (ФНЧ)
-# Расчет весовых коэффициентов КИХ-фильтра методом окон (частота среза 150 Гц, порядок фильтра 100)
-cutoff_hz = 150.0
-numtaps = 101
-fir_coeffs = firwin(numtaps, cutoff_hz, fs=Fs)
-# Линейная фильтрация входной последовательности
-filtered_signal = lfilter(fir_coeffs, 1.0, ecg_audio_signal)
+# Расчет групповой задержки линейно-фазового КИХ-фильтра (в отсчетах)
+group_delay = (NUMTAPS - 1) // 2
 
-# 6. Масштабирование и дискретизация по амплитуде (квантование)
-adc_values = (ecg_audio_signal * 1000).astype(int)
+# ===================================================
+# 6. ОБУЧЕНИЕ ML-НЕЙРОНА
+# ===================================================
+WINDOW_SIZE = 100
+features = []
+labels = []
 
-# 7. Преобразование плавающих коэффициентов в 16-битный целочисленный формат (Q15)
+for i in range(0, len(filtered_signal) - WINDOW_SIZE, WINDOW_SIZE):
+    window = filtered_signal[i : i + WINDOW_SIZE]
+    features.append([np.max(np.abs(window)), np.mean(np.abs(window))])
+
+    start_idx = i + group_delay
+    end_idx = start_idx + WINDOW_SIZE
+
+    if end_idx <= len(heart_beat):
+        reference_window = heart_beat[start_idx:end_idx]
+        labels.append(1 if np.max(np.abs(reference_window)) > 0.5 else 0)
+    else:
+        labels.append(0)
+
+X = np.array(features)
+y = np.array(labels)
+
+model = LogisticRegression()
+model.fit(X, y)
+
+# ===================================================
+# 7. ИЗВЛЕЧЕНИЕ ВЕСОВ
+# ===================================================
+weight1 = model.coef_[0][0]
+weight2 = model.coef_[0][1]
+bias = model.intercept_[0]
+
+print(f"WEIGHT1 = {weight1:.4f}")
+print(f"WEIGHT2 = {weight2:.4f}")
+print(f"BIAS = {bias:.4f}")
+
+# ===================================================
+# 8. СОХРАНЕНИЕ КОЭФФИЦИЕНТОВ FIR
+# ===================================================
 fir_coeffs_int = np.round(fir_coeffs * 32768).astype(int)
-
-# 8. Запись расчетных коэффициентов в текстовый файл формата HEX
 with open("coeffs.hex", "w") as f:
     for coeff in fir_coeffs_int:
         val = coeff & 0xFFFF
         f.write(f"{val:04x}\n")
 
-# 9. Текстовый вывод результатов в консоль
-print("Шаг 1.2 Завершен: Искусственный аудиосигнал сердца успешно сгенерирован!")
-print("Файл coeffs.hex успешно создан в памяти!")
-print("Первые 10 коэффициентов в HEX формате:")
-for i in range(10):
-    val = fir_coeffs_int[i] & 0xFFFF
-    print(f"Адрес [{i}]: {val:04x} (в десятичной системе: {fir_coeffs_int[i]})")
+# ===================================================
+# 9. СОХРАНЕНИЕ ВЕСОВ НЕЙРОНА
+# ===================================================
+with open("weights.hex", "w") as f:
+    for w in [weight1, weight2, bias]:
+        w_clipped = np.clip(w, -512.0, 511.9375)
+        w_int = int(np.round(w_clipped * 64)) & 0xFFFF
+        f.write(f"{val:04x}\n")
 
-# 10. Графический анализ результатов моделирования
-plt.figure(figsize=(10, 10))
+print("coeffs.hex и weights.hex созданы")
 
-# Временная диаграмма исходного сигнала
+# ===================================================
+# 10. ВИЗУАЛИЗАЦИЯ
+# ===================================================
+os.makedirs("docs", exist_ok=True)
+
+plt.figure(figsize=(10, 8))
+
 plt.subplot(3, 1, 1)
-plt.plot(t, heart_beat, color="blue")
-plt.title("Исходный сигнал сердцебиения (heart_beat)")
-plt.xlabel("Время, с")
-plt.ylabel("Амплитуда, у.е.")
-plt.xlim(0, 2.0)
+plt.plot(T, heart_beat, color="blue")
+plt.title("Signal 1 (Reference)")
 plt.grid(True)
 
-# Временная диаграмма зашумленного входного сигнала
 plt.subplot(3, 1, 2)
-plt.plot(t, ecg_audio_signal, color="salmon")
-plt.title("Зашумленный сигнал (полоса помехи 1200-1500 Гц)")
-plt.xlabel("Время, с")
-plt.ylabel("Амплитуда, у.е.")
-plt.xlim(0, 2.0)
+plt.plot(T, noisy_signal, color="salmon")
+plt.title("Signal 2 (Noisy)")
 plt.grid(True)
 
-# Временная диаграмма сигнала после прохождения КИХ-фильтра
 plt.subplot(3, 1, 3)
-plt.plot(t, filtered_signal, color="green")
-plt.title("Сигнал на выходе низкочастотного КИХ-фильтра (filtered_signal)")
-plt.xlabel("Время, с")
-plt.ylabel("Амплитуда, у.е.")
-plt.xlim(0, 2.0)
+plt.plot(T, filtered_signal, color="green")
+plt.title("Signal 3 (Filtered)")
 plt.grid(True)
 
 plt.tight_layout()
+plt.savefig("docs/graphs.png")
 plt.show()
+
 
 
